@@ -153,18 +153,21 @@ var _ = Describe("Node Health Check CR", func() {
 
 	Context("Reconciliation", func() {
 		var (
-			underTest      *v1alpha1.NodeHealthCheck
-			objects        []runtime.Object
-			reconciler     NodeHealthCheckReconciler
-			reconcileError error
-			getNHCError    error
+			underTest       *v1alpha1.NodeHealthCheck
+			objects         []runtime.Object
+			reconciler      NodeHealthCheckReconciler
+			upgradeChecker  fakeClusterUpgradeChecker
+			reconcileError  error
+			reconcileResult controllerruntime.Result
+			getNHCError     error
 		)
 
 		JustBeforeEach(func() {
 			client := fake.NewClientBuilder().WithRuntimeObjects(objects...).Build()
 			dynamicClient := newDynamicClient()
-			reconciler = NodeHealthCheckReconciler{Client: client, DynamicClient: dynamicClient, Log: controllerruntime.Log, Scheme: scheme.Scheme}
-			_, reconcileError = reconciler.Reconcile(
+			reconciler = NodeHealthCheckReconciler{
+				Client: client, DynamicClient: dynamicClient, Log: controllerruntime.Log, Scheme: scheme.Scheme, clusterUpgradeStatusChecker: &upgradeChecker}
+			reconcileResult, reconcileError = reconciler.Reconcile(
 				context.Background(),
 				controllerruntime.Request{NamespacedName: types.NamespacedName{Name: underTest.Name}})
 			getNHCError = reconciler.Get(
@@ -306,6 +309,32 @@ var _ = Describe("Node Health Check CR", func() {
 
 			})
 
+		})
+
+		When("Nodes are candidates for remediation and cluster is upgrading", func() {
+			BeforeEach(func() {
+				objects = newNodes(1, 2)
+				underTest = newNodeHealthCheck()
+				upgradeChecker = fakeClusterUpgradeChecker{upgrading: true}
+				remediationTemplate := newRemediationTemplate()
+				remediationCR := newRemediationCR("unhealthy-node-1")
+				objects = append(objects, underTest, remediationTemplate, remediationCR.DeepCopyObject())
+			})
+
+			It("requeues reconciliation to 1 minute from now", func() {
+				Expect(reconcileError).NotTo(HaveOccurred())
+				Expect(reconcileResult.RequeueAfter).To(Equal(1 * time.Minute))
+			})
+
+			It("does not remediate any node", func() {
+				Expect(underTest.Status.InFlightRemediations).To(HaveLen(0))
+			})
+
+			It("don't marks unhealthy nodes, just skip reconciliation", func() {
+				// we have 1 unhealthy and 2 healthy here
+				Expect(underTest.Status.HealthyNodes).To(Equal(2))
+				Expect(underTest.Status.ObservedNodes).To(Equal(3))
+			})
 		})
 	})
 
@@ -524,7 +553,14 @@ var TestRemediationCRD = &apiextensions.CustomResourceDefinition{
 }
 
 func newDynamicClient() *dynamicfake.FakeDynamicClient {
-	c := dynamicfake.NewSimpleDynamicClient(scheme.Scheme)
+	gvrToListKind := make(map[schema.GroupVersionResource]string)
+	gvrToListKind[schema.GroupVersionResource{
+		Group:    TestRemediationCRD.Spec.Group,
+		Version:  TestRemediationCRD.Spec.Versions[0].Name,
+		Resource: TestRemediationCRD.Spec.Names.Plural,
+	}] = TestRemediationCRD.Spec.Names.Kind + "List"
+	// updated fake client needs mapping ahead of time - see https://github.com/kubernetes/client-go/issues/949#issuecomment-811154420
+	c := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme.Scheme, gvrToListKind)
 	c.PrependReactor("create", "*", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
 		createAction := action.(testing.CreateAction)
 		object := createAction.GetObject()
@@ -537,4 +573,13 @@ func newDynamicClient() *dynamicfake.FakeDynamicClient {
 		return false, object, nil
 	})
 	return c
+}
+
+type fakeClusterUpgradeChecker struct {
+	upgrading bool
+	err       error
+}
+
+func (c *fakeClusterUpgradeChecker) check() (bool, error) {
+	return c.upgrading, c.err
 }

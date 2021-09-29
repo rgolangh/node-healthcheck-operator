@@ -50,12 +50,21 @@ const (
 	remediationCRAlertTimeout     = time.Hour * 48
 )
 
+// clusterUpgradeChecker checks if the cluster is currently under upgrade.
+// error should be thrown if it can't reliably determine if it's under upgrade or not.
+type clusterUpgradeChecker interface {
+	// check if the cluster is currently under upgrade.
+	// error should be thrown if it can't reliably determine if it's under upgrade or not.
+	check() (bool, error)
+}
+
 // NodeHealthCheckReconciler reconciles a NodeHealthCheck object
 type NodeHealthCheckReconciler struct {
 	client.Client
-	DynamicClient dynamic.Interface
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
+	DynamicClient               dynamic.Interface
+	Log                         logr.Logger
+	Scheme                      *runtime.Scheme
+	clusterUpgradeStatusChecker clusterUpgradeChecker
 }
 
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
@@ -105,7 +114,7 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return result, err
 	}
 
-	if len(unhealthyNodes) <= maxUnhealthy {
+	if r.shouldTryRemediation(unhealthyNodes, maxUnhealthy, &result) {
 		// trigger remediation per node
 		for _, n := range unhealthyNodes {
 			nextReconcile, err := r.remediate(ctx, n, nhc)
@@ -116,9 +125,6 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				updateResultNextReconcile(&result, *nextReconcile)
 			}
 		}
-	} else {
-		log.Info("Unhealthy nodes count reached the maximum allowed - skipping remediation.",
-			"unhealthyNodes", len(unhealthyNodes), "maxUnhealthy", maxUnhealthy)
 	}
 
 	inFlightRemediations, err := r.getInflightRemediations(nhc)
@@ -132,6 +138,38 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 	return result, nil
+}
+
+func (r *NodeHealthCheckReconciler) shouldTryRemediation(unhealthyNodes []v1.Node, maxUnhealthy int, result *ctrl.Result) bool {
+	if len(unhealthyNodes) == 0 {
+		return false
+	}
+	if len(unhealthyNodes) <= maxUnhealthy {
+		if r.isClusterUpgrading() {
+			updateResultNextReconcile(result, 1*time.Minute)
+			return false
+		}
+		return true
+	}
+	r.Log.Info("Unhealthy nodes count reached the maximum allowed - skipping remediation.",
+		"unhealthyNodes", len(unhealthyNodes), "maxUnhealthy", maxUnhealthy)
+	return false
+}
+
+func (r *NodeHealthCheckReconciler) isClusterUpgrading() bool {
+	r.Log.Info("checking if the cluster is upgrading")
+	clusterUpgrading, err := r.clusterUpgradeStatusChecker.check()
+	if err != nil {
+		// log the error but don't return - if we can't reliably tell if
+		// the cluster is upgrading then just continue with remediation.
+		// TODO finer error handling may help to decide otherwise here.
+		r.Log.Info("failed to check if the cluster is upgrading. Proceed with remediation as if it is not upgrading")
+	}
+	if clusterUpgrading {
+		r.Log.Info("skip remediation - the cluster is currently upgrading.")
+		return true
+	}
+	return false
 }
 
 func (r *NodeHealthCheckReconciler) fetchNodes(ctx context.Context, labelSelector metav1.LabelSelector) ([]v1.Node, error) {
